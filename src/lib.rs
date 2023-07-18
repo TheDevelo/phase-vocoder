@@ -129,11 +129,17 @@ impl Plugin for PhaseVocoder {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let pitch_shift = self.params.pitch_shift.smoothed.next_step(buffer.samples() as u32);
-        let pitch_shift_mult = 2.0_f32.powf(pitch_shift / 1200.0);
+        let mut pitch_shift = self.params.pitch_shift.value();
         let hann_window = util::window::hann(BLOCK_SIZE);
 
         self.stft.process_overlap_add(buffer, BLOCK_SIZE / WINDOW_SIZE, |channel_idx, window_buffer| {
+            // Since process_overlap_add iterates through all channels before moving onto the next
+            // window, we can advance the pitch shift in the block for more accuracy
+            if channel_idx == 0 {
+                pitch_shift = self.params.pitch_shift.smoothed.next_step(WINDOW_SIZE as u32);
+            }
+            let pitch_shift_mult = 2.0_f32.powf(pitch_shift / 1200.0);
+
             // Apply Hann Window
             for i in 0..BLOCK_SIZE {
                 window_buffer[i] *= hann_window[i];
