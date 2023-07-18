@@ -1,0 +1,27 @@
+[package]
+name = "phase_vocoder"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robert Fuchs <robertfuchsyoshi@gmail.com>"]
+license = "GPL-3.0-or-later"
+homepage = "thedevelo.github.io"
+description = "A phase vocoder"
+
+[workspace]
+members = ["xtask"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+realfft = "3.3.0"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
