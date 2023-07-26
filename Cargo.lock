@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "phase_vocoder"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nih_plug",
  "realfft",

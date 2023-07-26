@@ -130,15 +130,39 @@ impl Plugin for PhaseVocoder {
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let mut pitch_shift = self.params.pitch_shift.value();
+        let mut pitch_shift_mult = 2.0_f32.powf(pitch_shift / 1200.0);
         let hann_window = util::window::hann(BLOCK_SIZE);
+        let mut synth_window = hann_window.clone();
 
         self.stft.process_overlap_add(buffer, BLOCK_SIZE / WINDOW_SIZE, |channel_idx, window_buffer| {
             // Since process_overlap_add iterates through all channels before moving onto the next
             // window, we can advance the pitch shift in the block for more accuracy
             if channel_idx == 0 {
                 pitch_shift = self.params.pitch_shift.smoothed.next_step(WINDOW_SIZE as u32);
+                pitch_shift_mult = 2.0_f32.powf(pitch_shift / 1200.0);
+
+                // Recalculate the synthesis window from the Hann window for smoothing and volume normalization
+                // NOTE: Since the real synthesis window depends on the pitch shift of surrounding
+                // windows, we calculate an approximation assuming a constant shift
+                for i in 0..BLOCK_SIZE {
+                    let low_offset_float = (i as f32 - BLOCK_SIZE as f32) / pitch_shift_mult / (WINDOW_SIZE as f32);
+                    let high_offset_float = i as f32 / pitch_shift_mult / (WINDOW_SIZE as f32);
+                    let mut low_offset = low_offset_float.ceil() as i32;
+                    let high_offset = high_offset_float.floor() as i32;
+                    if low_offset_float == low_offset_float.ceil() {
+                        low_offset += 1
+                    }
+
+                    let mut denom_sum = 0.0;
+                    for n in low_offset..=high_offset {
+                        let offset = (n as f32 * pitch_shift_mult * WINDOW_SIZE as f32) as i32;
+                        let offset_idx = i as i32 - offset;
+                        denom_sum += hann_window[offset_idx as usize].powi(2);
+                    }
+
+                    synth_window[i] = hann_window[i] / denom_sum;
+                }
             }
-            let pitch_shift_mult = 2.0_f32.powf(pitch_shift / 1200.0);
 
             // Apply Hann Window
             for i in 0..BLOCK_SIZE {
@@ -200,12 +224,12 @@ impl Plugin for PhaseVocoder {
 
             self.c2r.process(&mut self.spectrum_buffer, &mut self.resample_buffer).unwrap();
 
-            // Apply Hann window for smoothing and normalize for FFT
+            // Apply synthesis window and FFT normalization
             for i in 0..BLOCK_SIZE {
-                self.resample_buffer[i] *= hann_window[i];
+                self.resample_buffer[i] *= synth_window[i];
                 self.resample_buffer[i] /= FFT_SIZE as f32;
             }
-            // Zero-out all other samples to finish the Hann windowing
+            // Zero-out all other samples to finish the windowing
             for i in BLOCK_SIZE..FFT_SIZE {
                 self.resample_buffer[i] = 0.0;
             }
