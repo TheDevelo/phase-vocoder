@@ -3,11 +3,36 @@ use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::f32;
 use std::sync::Arc;
+use std::collections::{BinaryHeap, HashSet};
+use std::cmp::{PartialOrd, Ord, Ordering};
 
 // Must have BLOCK_SIZE < FFT_SIZE and WINDOW_SIZE divide BLOCK_SIZE
 const BLOCK_SIZE: usize = 2048;
 const FFT_SIZE: usize = 8192;
 const WINDOW_SIZE: usize = 512;
+const TOLERANCE: f32 = 0.000001;
+
+// Struct used to calculate phase gradient heap integration
+#[derive(PartialEq)]
+struct PhaseBin {
+    magnitude: f32,
+    freq_idx: usize,
+    current: bool,
+}
+
+impl Ord for PhaseBin {
+    fn cmp(&self, other: &PhaseBin) -> Ordering {
+        self.magnitude.partial_cmp(&other.magnitude).unwrap()
+    }
+}
+
+impl PartialOrd for PhaseBin {
+    fn partial_cmp(&self, other: &PhaseBin) -> Option<Ordering> {
+        self.magnitude.partial_cmp(&other.magnitude)
+    }
+}
+
+impl Eq for PhaseBin {}
 
 struct PhaseVocoder {
     params: Arc<PhaseVocoderParams>,
@@ -20,6 +45,7 @@ struct PhaseVocoder {
 
     synth_phase: (Vec<f32>, Vec<f32>),
     prev_phase: (Vec<f32>, Vec<f32>),
+    prev_magnitude: (Vec<f32>, Vec<f32>),
     reset_phase: (bool, bool),
 }
 
@@ -40,6 +66,7 @@ impl Default for PhaseVocoder {
         let phase_len = spectrum_buffer.len();
         let synth_phase = (vec![0.0; phase_len], vec![0.0; phase_len]);
         let prev_phase = (vec![0.0; phase_len], vec![0.0; phase_len]);
+        let prev_magnitude = (vec![0.0; phase_len], vec![0.0; phase_len]);
 
         Self {
             params: Arc::new(PhaseVocoderParams::default()),
@@ -52,6 +79,7 @@ impl Default for PhaseVocoder {
 
             synth_phase,
             prev_phase,
+            prev_magnitude,
             reset_phase: (true, true),
         }
     }
@@ -175,15 +203,18 @@ impl Plugin for PhaseVocoder {
             let phase = self.spectrum_buffer.iter().map(|c| c.arg()).collect::<Vec<f32>>();
             let synth_phase;
             let prev_phase;
+            let prev_magnitude;
             let reset_phase;
             if channel_idx == 0 {
                 synth_phase = &mut self.synth_phase.0;
                 prev_phase = &mut self.prev_phase.0;
+                prev_magnitude = &mut self.prev_magnitude.0;
                 reset_phase = &mut self.reset_phase.0;
             }
             else {
                 synth_phase = &mut self.synth_phase.1;
                 prev_phase = &mut self.prev_phase.1;
+                prev_magnitude = &mut self.prev_magnitude.1;
                 reset_phase = &mut self.reset_phase.1;
             }
 
@@ -194,16 +225,67 @@ impl Plugin for PhaseVocoder {
                 *reset_phase = false;
             }
             else {
-                // Calculate forward phase using phase vocoder principals
-                let phase_derivative = phase.iter().zip(prev_phase.iter()).enumerate().map(|(n, (a, b))| {
+                // Calculate the phase to align with the previous window when pitch shifted
+                // The algorithm used is an improvement of a classical phase vocoder
+                // Detailed at: https://arxiv.org/pdf/2202.07382.pdf
+
+                // Calculate the time derivative
+                let time_derivative = phase.iter().zip(prev_phase.iter()).enumerate().map(|(n, (a, b))| {
                     let diff = a - b - 2.0 * f32::consts::PI * n as f32 * WINDOW_SIZE as f32 / FFT_SIZE as f32;
-                    let principal = diff - 2.0 * f32::consts::PI * (diff / 2.0 / f32::consts::PI).round();
-                    principal / WINDOW_SIZE as f32 + 2.0 * f32::consts::PI * n as f32 / FFT_SIZE as f32
+                    principal(diff) / WINDOW_SIZE as f32 + 2.0 * f32::consts::PI * n as f32 / FFT_SIZE as f32
                 }).collect::<Vec<f32>>();
 
-                for i in 0..synth_phase.len() {
-                    synth_phase[i] += pitch_shift_mult * WINDOW_SIZE as f32 * phase_derivative[i];
+                // Calculate the frequency derivative (using a centered scheme except for the edge cases)
+                let mut freq_derivative = vec![0.0; phase.len()];
+                freq_derivative[0] = principal(phase[1] - phase[0]);
+                freq_derivative[phase.len() - 1] = principal(phase[phase.len() - 1] - phase[phase.len() - 2]);
+                for i in 1..phase.len() - 1 {
+                    freq_derivative[i] = principal(phase[i + 1] - phase[i - 1]) / 2.0;
                 }
+
+                // Filter indices by tolerance, and set random phase if below tolerance
+                let mut significant_freq = HashSet::new();
+                let mut ordered_bins = BinaryHeap::new();
+                let max_magnitude = magnitude.iter().fold(0.0_f32, |max, val| max.max(*val)).max(prev_magnitude.iter().fold(0.0_f32, |max, val| max.max(*val)));
+                for i in 0..magnitude.len() {
+                    if magnitude[i] > max_magnitude * TOLERANCE {
+                        significant_freq.insert(i);
+                        ordered_bins.push(PhaseBin { magnitude: prev_magnitude[i], freq_idx: i, current: false });
+                    }
+                    else {
+                        synth_phase[i] = rand::random::<f32>() * f32::consts::PI * 2.0;
+                    }
+                }
+
+                // Perform the phase gradient heap integration algorithm
+                while !ordered_bins.is_empty() {
+                    let bin = ordered_bins.pop().unwrap();
+                    if bin.current {
+                        if significant_freq.contains(&(bin.freq_idx + 1)) {
+                            synth_phase[bin.freq_idx + 1] = synth_phase[bin.freq_idx] + pitch_shift_mult * freq_derivative[bin.freq_idx];
+                            significant_freq.remove(&(bin.freq_idx + 1));
+                            ordered_bins.push(PhaseBin { magnitude: magnitude[bin.freq_idx + 1], freq_idx: bin.freq_idx + 1, current: true });
+                        }
+                        if significant_freq.contains(&(bin.freq_idx - 1)) {
+                            synth_phase[bin.freq_idx - 1] = synth_phase[bin.freq_idx] - pitch_shift_mult * freq_derivative[bin.freq_idx];
+                            significant_freq.remove(&(bin.freq_idx - 1));
+                            ordered_bins.push(PhaseBin { magnitude: magnitude[bin.freq_idx - 1], freq_idx: bin.freq_idx - 1, current: true });
+                        }
+                    }
+                    else {
+                        if significant_freq.contains(&bin.freq_idx) {
+                            synth_phase[bin.freq_idx] += pitch_shift_mult * WINDOW_SIZE as f32 * time_derivative[bin.freq_idx];
+                            significant_freq.remove(&bin.freq_idx);
+                            ordered_bins.push(PhaseBin { magnitude: magnitude[bin.freq_idx], freq_idx: bin.freq_idx, current: true });
+                        }
+                    }
+                }
+
+                /*
+                for i in 0..synth_phase.len() {
+                    synth_phase[i] += pitch_shift_mult * WINDOW_SIZE as f32 * time_derivative[i];
+                }
+                */
             }
 
             // Set synth phase of first and last bin if applicable to fix issues with FFT
@@ -215,6 +297,7 @@ impl Plugin for PhaseVocoder {
 
             for i in 0..prev_phase.len() {
                 prev_phase[i] = phase[i];
+                prev_magnitude[i] = magnitude[i];
             }
 
             // Recalculate the spectrum with our new phases for inverse FFT
@@ -255,6 +338,10 @@ impl Plugin for PhaseVocoder {
 
         ProcessStatus::Normal
     }
+}
+
+fn principal(x: f32) -> f32 {
+    x - 2.0 * f32::consts::PI * (x / 2.0 / f32::consts::PI).round()
 }
 
 impl ClapPlugin for PhaseVocoder {
