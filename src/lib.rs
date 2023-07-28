@@ -7,10 +7,10 @@ use std::collections::{BinaryHeap, HashSet};
 use std::cmp::{PartialOrd, Ord, Ordering};
 
 // Must have BLOCK_SIZE < FFT_SIZE and WINDOW_SIZE divide BLOCK_SIZE
-const BLOCK_SIZE: usize = 2048;
-const FFT_SIZE: usize = 8192;
+const BLOCK_SIZE: usize = 4096;
+const FFT_SIZE: usize = 16384;
 const WINDOW_SIZE: usize = 512;
-const TOLERANCE: f32 = 0.000001;
+const TOLERANCE: f32 = 0.0001;
 
 // Struct used to calculate phase gradient heap integration
 #[derive(PartialEq)]
@@ -184,7 +184,7 @@ impl Plugin for PhaseVocoder {
                     let mut denom_sum = 0.0;
                     for n in low_offset..=high_offset {
                         let offset = (n as f32 * pitch_shift_mult * WINDOW_SIZE as f32) as i32;
-                        let offset_idx = i as i32 - offset;
+                        let offset_idx = (i as i32 - offset).max(0).min(BLOCK_SIZE as i32 - 1);
                         denom_sum += hann_window[offset_idx as usize].powi(2);
                     }
 
@@ -280,12 +280,6 @@ impl Plugin for PhaseVocoder {
                         }
                     }
                 }
-
-                /*
-                for i in 0..synth_phase.len() {
-                    synth_phase[i] += pitch_shift_mult * WINDOW_SIZE as f32 * time_derivative[i];
-                }
-                */
             }
 
             // Set synth phase of first and last bin if applicable to fix issues with FFT
